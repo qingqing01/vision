@@ -1,6 +1,8 @@
 import datetime
 import os
 import time
+import numpy as np
+from typing import Any, Optional
 
 import torch
 import torch.utils.data
@@ -15,6 +17,81 @@ try:
 except ImportError:
     amp = None
 
+import torchvision.transforms.functional_pil as F_pil
+
+try:
+    import accimage
+except ImportError:
+    accimage = None
+
+
+@torch.jit.unused
+def _is_numpy(img: Any) -> bool:
+    return isinstance(img, np.ndarray)
+
+
+@torch.jit.unused
+def _is_numpy_image(img: Any) -> bool:
+    return img.ndim in {2, 3}
+
+
+class MyToTensor:
+    def __init__(self, cuda_tensor=False, rank=0):
+        self.cuda_tensor = cuda_tensor
+        self.dev = 'cuda:%s'%rank 
+
+    def __call__(self, pic):
+        if not(F_pil._is_pil_image(pic) or _is_numpy(pic)):
+            raise TypeError('pic should be PIL Image or ndarray. Got {}'.format(type(pic)))
+    
+        if _is_numpy(pic) and not _is_numpy_image(pic):
+            raise ValueError('pic should be 2/3 dimensional. Got {} dimensions.'.format(pic.ndim))
+    
+        if isinstance(pic, np.ndarray):
+            # handle numpy array
+            if pic.ndim == 2:
+                pic = pic[:, :, None]
+    
+            img = torch.from_numpy(pic.transpose((2, 0, 1))).contiguous()
+            if self.cuda_tensor:
+                img = img.cuda(torch.device(self.dev))
+            # backward compatibility
+            if isinstance(img, torch.ByteTensor):
+                return img.float().div(255)
+            else:
+                return img
+    
+        # handle PIL Image
+        if pic.mode == 'I':
+            img = torch.from_numpy(np.array(pic, np.int32, copy=False))
+        elif pic.mode == 'I;16':
+            img = torch.from_numpy(np.array(pic, np.int16, copy=False))
+        elif pic.mode == 'F':
+            img = torch.from_numpy(np.array(pic, np.float32, copy=False))
+        elif pic.mode == '1':
+            img = 255 * torch.from_numpy(np.array(pic, np.uint8, copy=False))
+        else:
+            img = torch.ByteTensor(torch.ByteStorage.from_buffer(pic.tobytes()))
+    
+#        if self.cuda_tensor:
+            #img = img.cuda(torch.device(self.dev))
+#            img = img.cuda()
+        #print(img.device)
+        img = img.view(pic.size[1], pic.size[0], len(pic.getbands()))
+        # put it from HWC to CHW format
+        img = img.permute((2, 0, 1)).contiguous()
+        if isinstance(img, torch.ByteTensor):
+            img = img.float().div(255)
+        if self.cuda_tensor:
+            #img = img.cuda(torch.device(self.dev))
+            img = img.cuda()
+        #print('torch.cuda.current_device() ', torch.cuda.current_device())
+        return img
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq, apex=False):
     model.train()
@@ -26,8 +103,12 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     for image, target in metric_logger.log_every(data_loader, print_freq, header):
         start_time = time.time()
         image, target = image.to(device), target.to(device)
+        image.detach()
+        #print('image dev ', image.device)
         output = model(image)
+        #print('output dev ', output.device)
         loss = criterion(output, target)
+        #print('lossssslossss ', torch.cuda.current_device())
 
         optimizer.zero_grad()
         if apex:
@@ -79,7 +160,7 @@ def _get_cache_path(filepath):
     return cache_path
 
 
-def load_data(traindir, valdir, cache_dataset, distributed):
+def load_data(traindir, valdir, cache_dataset, distributed, rank, use_gtensor):
     # Data loading code
     print("Loading data")
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -93,14 +174,24 @@ def load_data(traindir, valdir, cache_dataset, distributed):
         print("Loading dataset_train from {}".format(cache_path))
         dataset, _ = torch.load(cache_path)
     else:
-        dataset = torchvision.datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]))
+        if use_gtensor:
+            dataset = torchvision.datasets.ImageFolder(
+                traindir,
+                transforms.Compose([
+                    MyToTensor(cuda_tensor=True, rank=rank),
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    normalize,
+                ]))
+        else:
+            dataset = torchvision.datasets.ImageFolder(
+                traindir,
+                transforms.Compose([
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    ToTensor(),
+                    normalize,
+                ]))
         if cache_dataset:
             print("Saving dataset_train to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -138,7 +229,9 @@ def load_data(traindir, valdir, cache_dataset, distributed):
     return dataset, dataset_test, train_sampler, test_sampler
 
 
-def main(args):
+import torch.distributed as dist
+
+def main(rank, args):
     if args.apex and amp is None:
         raise RuntimeError("Failed to import apex. Please install apex from https://www.github.com/nvidia/apex "
                            "to enable mixed-precision training.")
@@ -146,25 +239,27 @@ def main(args):
     if args.output_dir:
         utils.mkdir(args.output_dir)
 
-    utils.init_distributed_mode(args)
+    utils.init_distributed_mode(rank, args)
     print(args)
 
     device = torch.device(args.device)
+    print('dev ', device)
 
     torch.backends.cudnn.benchmark = True
 
     train_dir = os.path.join(args.data_path, 'train')
     val_dir = os.path.join(args.data_path, 'val')
     dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir,
-                                                                   args.cache_dataset, args.distributed)
+        args.cache_dataset, args.distributed, args.rank, args.use_gtensor)
     data_loader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size,
-        sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+        sampler=train_sampler, num_workers=args.workers, pin_memory=not args.use_gtensor)
 
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=args.batch_size,
-        sampler=test_sampler, num_workers=args.workers, pin_memory=True)
-
+#    data_loader_test = torch.utils.data.DataLoader(
+#        dataset_test, batch_size=args.batch_size,
+#        sampler=test_sampler, num_workers=args.workers, pin_memory=False)
+#
+    data_loader_test = None
     print("Creating model")
     model = torchvision.models.__dict__[args.model](pretrained=args.pretrained)
     model.to(device)
@@ -206,8 +301,9 @@ def main(args):
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, args.apex)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
-        if args.output_dir:
+        #evaluate(model, criterion, data_loader_test, device=device)
+        #if args.output_dir:
+        if False:
             checkpoint = {
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -230,13 +326,13 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
 
-    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', help='dataset')
-    parser.add_argument('--model', default='resnet18', help='model')
+    parser.add_argument('--data-path', default='data/', help='dataset')
+    parser.add_argument('--model', default='resnet50', help='model')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('-b', '--batch-size', default=32, type=int)
     parser.add_argument('--epochs', default=90, type=int, metavar='N',
                         help='number of total epochs to run')
-    parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
+    parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
                         help='number of data loading workers (default: 16)')
     parser.add_argument('--lr', default=0.1, type=float, help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -279,6 +375,8 @@ def parse_args():
     # Mixed precision training parameters
     parser.add_argument('--apex', action='store_true',
                         help='Use apex for mixed precision training')
+    parser.add_argument('--use_gtensor', action='store_true',
+                        help='Use GPU Tensor for transforms')
     parser.add_argument('--apex-opt-level', default='O1', type=str,
                         help='For apex mixed precision training'
                              'O0 for FP32 training, O1 for mixed precision training.'
@@ -294,7 +392,13 @@ def parse_args():
 
     return args
 
+import torch.multiprocessing as mp
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    print(args)
+    #main(0, args)
+    mp.spawn(main,
+        args=(args, ),
+        nprocs=args.world_size,
+        join=True)
